@@ -35,6 +35,7 @@
 #include <limits.h>
 #include <time.h>
 #include <pthread.h>
+#include <assert.h>
 
 #include "ntb-main-context.h"
 #include "ntb-list.h"
@@ -48,21 +49,14 @@ ntb_main_context_error;
 struct ntb_main_context_bucket;
 
 struct ntb_main_context {
-        /* This mutex only guards access to n_sources, the
-         * idle_sources list and the slice allocator so that idle
-         * sources can be added from other threads. Everything else
-         * should only be accessed from the main thread so it doesn't
-         * need to guarded. Removing an idle source can only happen in
-         * the main thread. That is necessary because it is difficult
-         * to cope with random idle sources being removed while we are
-         * iterating the list */
+        /* This mutex the idle_sources list and the slice allocator so
+         * that idle sources can be added from other threads.
+         * Everything else should only be accessed from the main
+         * thread so it doesn't need to guarded. Removing an idle
+         * source can only happen in the main thread. That is
+         * necessary because it is difficult to cope with random idle
+         * sources being removed while we are iterating the list */
         pthread_mutex_t idle_mutex;
-
-        /* Number of sources that are currently attached. This is used
-           so we can size the array passed to poll and to check that
-           there aren't any sources left when the main context is
-           destroyed */
-        unsigned int n_sources;
 
         /* Array for receiving events */
         struct ntb_buffer poll_array;
@@ -112,7 +106,11 @@ struct ntb_main_context_source {
                 };
 
                 /* Timer sources */
-                struct ntb_main_context_bucket *bucket;
+                struct {
+                        struct ntb_main_context_bucket *bucket;
+                        bool busy;
+                        bool removed;
+                };
         };
 
         void *user_data;
@@ -141,6 +139,16 @@ ntb_main_context_get_default(void)
                 ntb_main_context_default = ntb_main_context_new();
 
         return ntb_main_context_default;
+}
+
+static void
+free_source(struct ntb_main_context *mc,
+            struct ntb_main_context_source *source)
+{
+        pthread_mutex_lock(&mc->idle_mutex);
+        ntb_list_remove(&source->link);
+        ntb_slice_free(&mc->source_allocator, source);
+        pthread_mutex_unlock(&mc->idle_mutex);
 }
 
 static void
@@ -190,7 +198,6 @@ ntb_main_context_new(void)
         ntb_slice_allocator_init(&mc->source_allocator,
                                  sizeof(struct ntb_main_context_source),
                                  NTB_ALIGNOF(struct ntb_main_context_source));
-        mc->n_sources = 0;
         mc->monotonic_time_valid = false;
         mc->wall_time_valid = false;
         mc->poll_array_dirty = true;
@@ -234,7 +241,6 @@ ntb_main_context_add_poll(struct ntb_main_context *mc,
 
         pthread_mutex_lock(&mc->idle_mutex);
         source = ntb_slice_alloc(&mc->source_allocator);
-        mc->n_sources++;
         pthread_mutex_unlock(&mc->idle_mutex);
 
         source->mc = mc;
@@ -275,7 +281,6 @@ ntb_main_context_add_quit(struct ntb_main_context *mc,
 
         pthread_mutex_lock(&mc->idle_mutex);
         source = ntb_slice_alloc(&mc->source_allocator);
-        mc->n_sources++;
         pthread_mutex_unlock(&mc->idle_mutex);
 
         source->mc = mc;
@@ -320,7 +325,6 @@ ntb_main_context_add_timer(struct ntb_main_context *mc,
 
         pthread_mutex_lock(&mc->idle_mutex);
         source = ntb_slice_alloc(&mc->source_allocator);
-        mc->n_sources++;
         pthread_mutex_unlock(&mc->idle_mutex);
 
         source->mc = mc;
@@ -328,6 +332,8 @@ ntb_main_context_add_timer(struct ntb_main_context *mc,
         source->callback = callback;
         source->type = NTB_MAIN_CONTEXT_TIMER_SOURCE;
         source->user_data = user_data;
+        source->removed = false;
+        source->busy = false;
 
         ntb_list_insert(&source->bucket->sources, &source->link);
 
@@ -356,7 +362,6 @@ ntb_main_context_add_idle(struct ntb_main_context *mc,
         pthread_mutex_lock(&mc->idle_mutex);
         source = ntb_slice_alloc(&mc->source_allocator);
         ntb_list_insert(&mc->idle_sources, &source->link);
-        mc->n_sources++;
         pthread_mutex_unlock(&mc->idle_mutex);
 
         source->mc = mc;
@@ -373,41 +378,29 @@ void
 ntb_main_context_remove_source(struct ntb_main_context_source *source)
 {
         struct ntb_main_context *mc = source->mc;
-        struct ntb_main_context_bucket *bucket;
-
 
         switch (source->type) {
         case NTB_MAIN_CONTEXT_POLL_SOURCE:
+                free_source(mc, source);
                 mc->poll_array_dirty = true;
-                ntb_list_remove(&source->link);
-                break;
-
-        case NTB_MAIN_CONTEXT_QUIT_SOURCE:
-                ntb_list_remove(&source->link);
                 break;
 
         case NTB_MAIN_CONTEXT_IDLE_SOURCE:
-                pthread_mutex_lock(&mc->idle_mutex);
-                ntb_list_remove(&source->link);
-                pthread_mutex_unlock(&mc->idle_mutex);
+        case NTB_MAIN_CONTEXT_QUIT_SOURCE:
+                free_source(mc, source);
                 break;
 
         case NTB_MAIN_CONTEXT_TIMER_SOURCE:
-                bucket = source->bucket;
-                ntb_list_remove(&source->link);
-
-                if (ntb_list_empty(&bucket->sources)) {
-                        ntb_list_remove(&bucket->link);
-                        ntb_slice_free(&ntb_main_context_bucket_allocator,
-                                       bucket);
-                }
+                /* Timer sources need to be able to be removed while
+                 * iterating the source list to emit, so we need to
+                 * handle them specially during iteration. */
+                assert(!source->removed);
+                if (source->busy)
+                        source->removed = true;
+                else
+                        free_source(mc, source);
                 break;
         }
-
-        pthread_mutex_lock(&mc->idle_mutex);
-        ntb_slice_free(&mc->source_allocator, source);
-        mc->n_sources--;
-        pthread_mutex_unlock(&mc->idle_mutex);
 }
 
 static int
@@ -448,26 +441,9 @@ get_timeout(struct ntb_main_context *mc)
 }
 
 static void
-emit_bucket(struct ntb_main_context_bucket *bucket)
-{
-        struct ntb_main_context_source *source, *tmp_source;
-        ntb_main_context_timer_callback callback;
-
-        ntb_list_for_each_safe(source,
-                               tmp_source,
-                               &bucket->sources,
-                               link) {
-                callback = source->callback;
-                callback(source, source->user_data);
-        }
-
-        bucket->minutes_passed = 0;
-}
-
-static void
 check_timer_sources(struct ntb_main_context *mc)
 {
-        struct ntb_main_context_bucket *bucket, *tmp_bucket;
+        struct ntb_main_context_bucket *bucket;
         int64_t now;
         int64_t elapsed_minutes;
 
@@ -481,11 +457,47 @@ check_timer_sources(struct ntb_main_context *mc)
         if (elapsed_minutes < 1)
                 return;
 
-        ntb_list_for_each_safe(bucket, tmp_bucket, &mc->buckets, link) {
-                if (bucket->minutes_passed + elapsed_minutes >= bucket->minutes)
-                        emit_bucket(bucket);
-                else
+        /* Collect all of the sources to emit into a list and mark
+         * them as busy. That way if they are removed they will just
+         * be marked as removed instead of actually modifying the
+         * bucket’s list. That way any timers can be removed as a
+         * result of invoking any callback.
+         */
+        struct ntb_list to_emit;
+        ntb_list_init(&to_emit);
+
+        ntb_list_for_each(bucket, &mc->buckets, link) {
+                if (bucket->minutes_passed + elapsed_minutes >=
+                    bucket->minutes) {
+                        ntb_list_insert_list(&to_emit, &bucket->sources);
+                        bucket->minutes_passed = 0;
+                        ntb_list_init(&bucket->sources);
+                } else {
                         bucket->minutes_passed += elapsed_minutes;
+                }
+        }
+
+        struct ntb_main_context_source *source, *tmp_source;
+
+        ntb_list_for_each(source, &to_emit, link) {
+                source->busy = true;
+        }
+
+        ntb_list_for_each(source, &to_emit, link) {
+                if (source->removed)
+                        continue;
+                ntb_main_context_timer_callback callback = source->callback;
+                callback(source, source->user_data);
+        }
+
+        ntb_list_for_each_safe(source, tmp_source, &to_emit, link) {
+                if (source->removed) {
+                        free_source(mc, source);
+                } else {
+                        ntb_list_insert(&source->bucket->sources,
+                                        &source->link);
+                        source->busy = false;
+                }
         }
 }
 
@@ -683,6 +695,17 @@ ntb_main_context_get_wall_clock(struct ntb_main_context *mc)
         return mc->wall_time;
 }
 
+static void
+free_buckets(struct ntb_main_context *mc)
+{
+        struct ntb_main_context_bucket *bucket, *tmp;
+
+        ntb_list_for_each_safe(bucket, tmp, &mc->buckets, link) {
+                assert(ntb_list_empty(&bucket->sources));
+                ntb_slice_free(&ntb_main_context_bucket_allocator, bucket);
+        }
+}
+
 void
 ntb_main_context_free(struct ntb_main_context *mc)
 {
@@ -694,9 +717,11 @@ ntb_main_context_free(struct ntb_main_context *mc)
         ntb_close(mc->async_pipe[0]);
         ntb_close(mc->async_pipe[1]);
 
-        if (mc->n_sources > 0)
-                ntb_warning("Sources still remain on a main context "
-                            "that is being freed");
+        assert(ntb_list_empty(&mc->quit_sources));
+        assert(ntb_list_empty(&mc->idle_sources));
+        assert(ntb_list_empty(&mc->poll_sources));
+
+        free_buckets(mc);
 
         pthread_mutex_destroy(&mc->idle_mutex);
 
