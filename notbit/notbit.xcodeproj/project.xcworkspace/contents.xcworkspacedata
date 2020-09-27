@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Workspace
+   version = "1.0">
+   <FileRef
+      location = "group:../../autogen.sh">
+   </FileRef>
+   <FileRef
+      location = "group:../../build">
+   </FileRef>
+   <FileRef
+      location = "group:../../configure.ac">
+   </FileRef>
+   <FileRef
+      location = "group:../../COPYING">
+   </FileRef>
+   <FileRef
+      location = "group:../../doc">
+   </FileRef>
+   <FileRef
+      location = "group:../../Makefile.am">
+   </FileRef>
+   <FileRef
+      location = "group:../../NEWS">
+   </FileRef>
+   <FileRef
+      location = "group:../../README.md">
+   </FileRef>
+   <FileRef
+      location = "group:../../src">
+   </FileRef>
+   <FileRef
+      location = "group:../../TODO">
+   </FileRef>
+   <FileRef
+      location = "self:">
+   </FileRef>
+</Workspace>
