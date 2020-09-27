@@ -24,7 +24,7 @@
 #include "config.h"
 
 #include <assert.h>
-
+#include <sys/types.h> // this is commit 55b8165cc52963b1b1c6f21ba4d3b4506b4ec6e4 on a PR at neils master
 #include "ntb-mail-parser.h"
 #include "ntb-buffer.h"
 #include "ntb-parse-content-type.h"
