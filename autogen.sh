@@ -27,7 +27,20 @@ if test -z "$NOCONFIGURE"; then
                     "command line."
         fi
 fi
-
+ACLOCAL=`which aclocal`
+if test -z $ACLOCAL; then
+        echo "*** No ACLOCAL found, please install it ***"
+        exit 1
+else
+export ACLOCAL
+fi
+AUTOMAKE=`which automake`
+if test -z $AUTOMAKE; then
+        echo "*** No AUTOMAKE found, please install it ***"
+        exit 1
+else
+    export AUTOMAKE
+fi
 rm -rf autom4te.cache
 
 autoreconf --force --install --verbose || exit $?
